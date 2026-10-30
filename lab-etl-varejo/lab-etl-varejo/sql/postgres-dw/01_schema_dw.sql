@@ -164,6 +164,12 @@ CREATE TABLE abt.recompra_90d (
   cliente_sk          BIGINT  NOT NULL REFERENCES dw.dim_cliente (cliente_sk),
   data_corte          DATE    NOT NULL,
   alvo_recompra_90d   SMALLINT NOT NULL CHECK (alvo_recompra_90d IN (0,1)),
+  recencia_dias       INTEGER,
+  frequencia_pedidos  INTEGER,
+  valor_monetario     NUMERIC,
+  ticket_medio        NUMERIC,
+  prazo_medio_entrega NUMERIC,
+  taxa_cancelamento   NUMERIC,
   -- ------------------------------------------------------------------
   -- A PARTIR DAQUI: atributos preditivos desenhados por vocês.
   -- Exemplos do que é legítimo (calculado somente até data_corte):
@@ -171,6 +177,23 @@ CREATE TABLE abt.recompra_90d (
   --   ticket_medio, prazo_medio_entrega, qtd_atendimentos_sac,
   --   nota_media_avaliacoes, categorias_distintas, canal_predominante
   -- ------------------------------------------------------------------
+  PRIMARY KEY (cliente_sk, data_corte)
+);
+
+DROP TABLE IF EXISTS abt.recompra_90d_vazamento CASCADE;
+CREATE TABLE abt.recompra_90d_vazamento (
+  cliente_sk                 BIGINT  NOT NULL REFERENCES dw.dim_cliente (cliente_sk),
+  data_corte                 DATE    NOT NULL,
+  alvo_recompra_90d          SMALLINT NOT NULL CHECK (alvo_recompra_90d IN (0,1)),
+  recencia_dias              INTEGER,
+  frequencia_pedidos         INTEGER,
+  valor_monetario            NUMERIC,
+  ticket_medio               NUMERIC,
+  prazo_medio_entrega        NUMERIC,
+  taxa_cancelamento          NUMERIC,
+  recencia_dias_vazado       INTEGER,
+  frequencia_pedidos_vazado  INTEGER,
+  valor_monetario_z          NUMERIC,
   PRIMARY KEY (cliente_sk, data_corte)
 );
 

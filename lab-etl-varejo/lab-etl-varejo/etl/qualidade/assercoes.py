@@ -101,9 +101,14 @@ class Suite:
         """)
         with engine.begin() as cx:
             for r in self.resultados:
-                cx.execute(sql, dict(etapa=self.etapa, nome=r.nome,
-                                     descricao=r.descricao, valor=r.valor_obtido,
-                                     esperado=r.valor_esperado, ok=r.aprovado))
+                cx.execute(sql, dict(
+                    etapa=self.etapa,
+                    nome=r.nome,
+                    descricao=r.descricao,
+                    valor=_para_python(r.valor_obtido),
+                    esperado=r.valor_esperado,
+                    ok=_para_python(r.aprovado),
+                ))
 
     def imprimir(self):
         largura = max((len(r.nome) for r in self.resultados), default=10)
@@ -127,3 +132,17 @@ def _num(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _para_python(v):
+    if hasattr(v, "item"):
+        try:
+            return v.item()
+        except (ValueError, TypeError):
+            pass
+    if hasattr(v, "tolist"):
+        try:
+            return v.tolist()
+        except (TypeError, ValueError):
+            pass
+    return v

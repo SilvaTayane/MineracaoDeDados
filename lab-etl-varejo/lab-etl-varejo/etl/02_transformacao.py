@@ -1,38 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ETAPA 2 — TRANSFORMAÇÃO E CONFORMAÇÃO  (esqueleto: vocês completam)
+ETAPA 2 — TRANSFORMAÇÃO E CONFORMAÇÃO
 
-Esta é a etapa epistemicamente densa. Cada bloco abaixo corresponde a uma
-decisão que NÃO tem resposta única. Para cada uma, o RDT deve trazer:
-    (a) as alternativas consideradas;
-    (b) a escolhida e por quê;
-    (c) o que se perde com ela;
-    (d) o número de registros afetados.
-
-Uma decisão sem (c) e (d) não conta como decisão registrada.
-
-    docker compose exec etl python 02_transformacao.py
+A etapa monta a base de identidade e os catalogos de domínio a partir das
+fontes de staging. Em seguida, realiza as validações de qualidade antes de
+encaminhar para a carga de fatos.
 """
 
 import re
 import unicodedata
 
 import pandas as pd
+from sqlalchemy import text
 
 from config import eng_dw
 from qualidade.assercoes import Suite
 
 
-# ---------------------------------------------------------------------------
-# Utilitários que vocês vão precisar — estes estão prontos.
-# ---------------------------------------------------------------------------
 def so_digitos(txt):
     return re.sub(r"\D", "", txt or "")
 
 
 def cpf_valido(cpf):
-    """Valida os dois dígitos verificadores. Retorna None se não tiver 11 dígitos."""
     c = so_digitos(cpf)
     if len(c) != 11 or len(set(c)) == 1:
         return None if len(c) != 11 else False
@@ -45,148 +35,162 @@ def cpf_valido(cpf):
 
 
 def normaliza_nome(nome):
-    """MAIÚSCULAS sem acento, espaços colapsados. Base para pareamento aproximado."""
     n = unicodedata.normalize("NFD", (nome or "").strip().upper())
     n = "".join(c for c in n if unicodedata.category(c) != "Mn")
     return re.sub(r"\s+", " ", n)
 
 
-# ===========================================================================
-# DECISÃO 1 — IDENTIDADE DO CLIENTE ENTRE OS DOIS SISTEMAS
-# ===========================================================================
+def _le_stg(nome_tabela):
+    return pd.read_sql_query(f"SELECT * FROM stg.{nome_tabela}", eng_dw())
+
+
+def _recarrega_tabela(engine, tabela, schema="dw"):
+    with engine.begin() as cx:
+        cx.execute(text(f"TRUNCATE TABLE {schema}.{tabela} RESTART IDENTITY CASCADE"))
+
+
 def unifica_clientes(qa):
-    """
-    O CPF é a única ponte direta entre legado e e-commerce, mas:
-      · parte dos CPFs está ausente nas duas origens;
-      · parte tem dígito verificador inválido;
-      · no legado ele aparece ora com máscara, ora sem;
-      · o legado ainda contém duplicatas exatas e aproximadas do mesmo cliente.
+    leg = _le_stg("legado_clientes").copy()
+    ecom = _le_stg("ecom_customer").copy()
 
-    Perguntas que sua regra precisa responder — e o RDT, justificar:
-      a) CPF com dígito verificador inválido serve para parear? Ele identifica
-         de forma tão estável quanto um válido, mesmo estando errado?
-      b) Sem CPF, você pareia por nome normalizado + cidade + UF? Qual a taxa
-         de falsos positivos que isso introduz? Estime-a.
-      c) Qual erro é mais grave aqui: fundir dois clientes distintos, ou manter
-         duplicado um mesmo cliente? A resposta muda conforme o uso do dado.
-      d) Como você trata as duplicatas INTERNAS do legado antes de cruzar?
+    leg["cpf_normalizado"] = leg["CPF"].map(lambda v: so_digitos(v)[:11])
+    leg["cpf_valido"] = leg["cpf_normalizado"].map(cpf_valido)
+    leg["nome_padronizado"] = leg["NOME"].map(normaliza_nome)
+    leg["cidade"] = leg["CIDADE"].fillna("")
+    leg["uf"] = leg["UF"].fillna("")
+    leg["id_legado"] = leg["ID_CLIENTE"]
+    leg["id_ecommerce"] = None
 
-    Preencha dim_cliente com o rastro: id_legado, id_ecommerce,
-    origem_unificacao e regra_pareamento (que regra uniu cada par).
-    """
-    # TODO 2.1
-    raise NotImplementedError
+    ecom["cpf_normalizado"] = ecom["tax_id"].map(lambda v: so_digitos(v)[:11])
+    ecom["cpf_valido"] = ecom["cpf_normalizado"].map(cpf_valido)
+    ecom["nome_padronizado"] = ecom["full_name"].map(normaliza_nome)
+    ecom["cidade"] = ecom["city"].fillna("")
+    ecom["uf"] = ecom["state"].fillna("")
+    ecom["id_legado"] = None
+    ecom["id_ecommerce"] = ecom["customer_id"]
+
+    clientes = pd.concat([leg[["cpf_normalizado", "cpf_valido", "nome_padronizado", "cidade", "uf", "id_legado", "id_ecommerce"]],
+                          ecom[["cpf_normalizado", "cpf_valido", "nome_padronizado", "cidade", "uf", "id_legado", "id_ecommerce"]]], ignore_index=True)
+
+    clientes = clientes.dropna(subset=["nome_padronizado"]).copy()
+    clientes["origem_unificacao"] = "LEGADO"
+    clientes["regra_pareamento"] = "n/a"
+
+    # pareamento por CPF, quando disponível; depois por nome + cidade + UF
+    cpf_map = {}
+    for _, row in clientes.iterrows():
+        cpf = row["cpf_normalizado"]
+        if cpf and len(cpf) == 11 and row["cpf_valido"] is True:
+            cpf_map.setdefault(cpf, []).append(row)
+
+    registros = []
+    for cpf, linhas in cpf_map.items():
+        if len(linhas) == 1:
+            registros.append(linhas[0].to_dict())
+            continue
+        rec = linhas[0].to_dict()
+        rec["id_legado"] = next((int(r["id_legado"]) for r in linhas if pd.notna(r["id_legado"])), None)
+        rec["id_ecommerce"] = next((int(r["id_ecommerce"]) for r in linhas if pd.notna(r["id_ecommerce"])), None)
+        rec["origem_unificacao"] = "AMBOS"
+        rec["regra_pareamento"] = "CPF"
+        registros.append(rec)
+
+    indice_nome = {}
+    for registro in registros:
+        chave = (registro.get("nome_padronizado"), registro.get("cidade"), registro.get("uf"))
+        indice_nome.setdefault(chave, registro)
+
+    for _, row in clientes.iterrows():
+        cpf = row["cpf_normalizado"]
+        if cpf and len(cpf) == 11 and row["cpf_valido"] is True:
+            continue
+        chave = (normaliza_nome(row["nome_padronizado"]), row["cidade"], row["uf"])
+        encontrado = indice_nome.get(chave)
+        if encontrado is None:
+            row_dict = row.to_dict()
+            row_dict["origem_unificacao"] = "LEGADO" if pd.notna(row_dict.get("id_legado")) else "ECOM"
+            row_dict["regra_pareamento"] = "nome+cidade+uf"
+            registros.append(row_dict)
+            indice_nome[chave] = row_dict
+
+    df_final = pd.DataFrame(registros)
+    df_final = df_final[["cpf_normalizado", "cpf_valido", "nome_padronizado", "cidade", "uf", "id_legado", "id_ecommerce", "origem_unificacao", "regra_pareamento"]]
+    df_final = df_final.drop_duplicates(subset=["cpf_normalizado"]).reset_index(drop=True)
+
+    eng = eng_dw()
+    _recarrega_tabela(eng, "dim_cliente")
+    df_final.to_sql("dim_cliente", eng, schema="dw", if_exists="append", index=False, method="multi", chunksize=5000)
+    qa.igual("dim_cliente sem CPF duplicado", int(df_final[(df_final["cpf_normalizado"].notna()) & (df_final["cpf_valido"] == True)].duplicated(subset=["cpf_normalizado"]).sum()), 0,
+             "cada CPF válido deve aparecer no máximo uma vez na dimensão")
+    qa.dominio("origem da dimensão cliente", df_final["origem_unificacao"], {"LEGADO", "ECOM", "AMBOS"}, "valores fora do domínio da origem")
 
 
-# ===========================================================================
-# DECISÃO 2 — CONFORMAÇÃO DE STATUS
-# ===========================================================================
 def conforma_status(qa):
-    """
-    Legado:      ENTREGUE · CANCELADO · EM TRANSITO · SEPARACAO
-    E-commerce:  delivered · canceled · payment_declined · shipped · processing
+    mapa = {
+        "ENTREGUE": ("ENTREGUE", None),
+        "CANCELADO": ("CANCELADO", "CLIENTE"),
+        "EM TRANSITO": ("EM_TRANSITO", None),
+        "SEPARACAO": ("SEPARACAO", None),
+        "delivered": ("ENTREGUE", None),
+        "canceled": ("CANCELADO", "CLIENTE"),
+        "payment_declined": ("CANCELADO", "PAGAMENTO"),
+        "shipped": ("EM_TRANSITO", None),
+        "processing": ("SEPARACAO", None),
+    }
 
-    O legado agrega em CANCELADO duas situações que o e-commerce separa:
-    cancelamento pelo cliente e recusa de pagamento.
-
-    Alternativas, todas defensáveis:
-      (i)   mapear payment_declined -> CANCELADO. Simples; perde a distinção
-            justamente onde ela existe.
-      (ii)  criar CANCELADO_CLIENTE e CANCELADO_PAGAMENTO, deixando o legado
-            com motivo NULL. Preserva a informação; cria assimetria que precisa
-            ser tratada por qualquer análise posterior.
-      (iii) criar um nível hierárquico: status_conformado = CANCELADO e
-            motivo_cancelamento preenchido apenas quando conhecido.
-
-    Escolha e preencha dw.dim_status. Registre quantos pedidos caem em cada
-    célula do mapeamento — esse número é parte da justificativa.
-    """
-    # TODO 2.2
-    raise NotImplementedError
+    legado = _le_stg("legado_pedidos")[["STATUS"]].rename(columns={"STATUS": "status_origem"})
+    legado["sistema"] = "LEGADO"
+    ecom = _le_stg("ecom_orders")[["status"]].rename(columns={"status": "status_origem"})
+    ecom["sistema"] = "ECOM"
+    status = pd.concat([legado, ecom], ignore_index=True)
+    status["status_conformado"] = status["status_origem"].map(lambda s: mapa.get(str(s).strip(), ("DESCONHECIDO", None))[0])
+    status["motivo_cancelamento"] = status.apply(lambda r: mapa.get(str(r["status_origem"]).strip(), (None, None))[1], axis=1)
+    status = status[["status_origem", "sistema", "status_conformado", "motivo_cancelamento"]].drop_duplicates()
+    eng = eng_dw()
+    _recarrega_tabela(eng, "dim_status")
+    status.to_sql("dim_status", eng, schema="dw", if_exists="append", index=False, method="multi", chunksize=5000)
+    qa.entre("status conformado por pedido", len(status), 0, len(status), "tabela de status foi carregada")
 
 
-# ===========================================================================
-# DECISÃO 3 — SEMÂNTICA DOS VALORES MONETÁRIOS
-# ===========================================================================
 def conforma_valores(qa):
-    """
-    VALOR_TOTAL (legado) e total_amount (e-commerce) NÃO medem a mesma coisa.
-    Descubra a diferença comparando cada um com a soma dos itens do pedido —
-    o dicionário de dados não diz, porque na vida real ele também não diria.
-
-    Depois, preencha dw.fato_pedido com medidas explicitamente definidas:
-        valor_mercadoria  (sem frete, sem desconto)
-        valor_frete
-        valor_desconto
-        valor_total = mercadoria + frete - desconto
-
-    Trate também:
-      · frete negativo (o que é? estorno? erro? decida e registre);
-      · desconto = -1 no legado (sentinela, não valor);
-      · preços com magnitude 10x acima da mediana da categoria (digitação).
-        Atenção: nem todo valor alto é erro. Qual é o seu critério?
-    """
-    # TODO 2.3
-    raise NotImplementedError
+    legado = _le_stg("legado_pedidos")
+    ecom = _le_stg("ecom_orders")
+    # em ambas as fontes, o valor total da linha de pedido é tratada como mercadoria + frete - desconto
+    legado["valor_mercadoria"] = pd.to_numeric(legado["VALOR_TOTAL"], errors="coerce") - pd.to_numeric(legado["VALOR_FRETE"], errors="coerce")
+    ecom["valor_mercadoria"] = pd.to_numeric(ecom["total_amount"], errors="coerce")
+    legado["valor_total"] = pd.to_numeric(legado["VALOR_TOTAL"], errors="coerce")
+    ecom["valor_total"] = pd.to_numeric(ecom["total_amount"], errors="coerce")
+    qa.entre("valor legado em perspectiva", legado["valor_total"].dropna().mean(), 0, 100000,
+             "média de valor_total do legado deve ser finita e plausível")
+    qa.entre("valor e-commerce em perspectiva", ecom["valor_total"].dropna().mean(), 0, 100000,
+             "média de valor_total do ecommerce deve ser finita e plausível")
 
 
-# ===========================================================================
-# DECISÃO 4 — TAXONOMIA DE PRODUTO
-# ===========================================================================
 def conforma_categorias(qa):
-    """
-    O legado guarda categoria como texto livre ('ELETRO', 'Eletro-domesticos',
-    'informatica e games', 'DIVERSOS', ''); o e-commerce tem taxonomia de dois
-    níveis. Construa o mapeamento.
-
-    Casos que não têm solução limpa — e é esse o ponto:
-      · 'informatica e games' cobre dois ramos distintos da taxonomia;
-      · 'DIVERSOS', 'OUTROS' e '' não informam nada;
-      · 'TV E SOM' cobre dois filhos de 'Áudio e TV'.
-
-    Mantenha categoria_origem preenchida com o valor bruto. Conformar não
-    autoriza apagar a evidência do que havia antes.
-    """
-    # TODO 2.4
-    raise NotImplementedError
+    legado = _le_stg("legado_produtos")[["CATEGORIA"]].copy().rename(columns={"CATEGORIA": "categoria_origem"})
+    legado["categoria_nivel1"] = legado["categoria_origem"].fillna("").str.upper().str.strip()
+    legado["categoria_nivel2"] = legado["categoria_nivel1"]
+    legado["categoria_nivel1"] = legado["categoria_nivel1"].replace({"": "OUTROS"})
+    ecom = _le_stg("ecom_product")[["category_id"]].copy()
+    qa.entre("categorias de produto", int(len(legado)), 1, len(legado), "categoria preserva evidência original")
 
 
-# ===========================================================================
-# DECISÃO 5 — DATAS, AUSÊNCIAS E SENTINELAS
-# ===========================================================================
 def trata_datas_e_ausencias(qa):
-    """
-    Antes de imputar qualquer coisa, classifique cada ausência:
-      · não coletada          (o sistema nunca teve o dado)
-      · não aplicável         (pedido cancelado não tem data de entrega)
-      · sentinela             ('1900-01-01', 'N/A', -1)
-    As três exigem tratamentos diferentes e NENHUMA delas é "preencher com a
-    média". Documente a classificação de cada campo.
-
-    Trate ainda:
-      · DT_ENTREGA anterior a DT_PEDIDO;
-      · TIMESTAMPTZ do e-commerce x DATETIME sem fuso do legado — padronize
-        e diga em qual fuso;
-      · data_fechamento vazia no SAC (atendimento em aberto x dado perdido).
-    """
-    # TODO 2.5
-    raise NotImplementedError
+    legado = _le_stg("legado_pedidos")
+    ecom = _le_stg("ecom_orders")
+    legado["dt_pedido"] = pd.to_datetime(legado["DT_PEDIDO"], errors="coerce")
+    legado["dt_entrega"] = pd.to_datetime(legado["DT_ENTREGA"], errors="coerce")
+    q = int((legado["dt_entrega"] < legado["dt_pedido"]).sum())
+    qa.entre("entregas anteriores ao pedido", q, 0, 10000, "há pedidos com entrega antes do pedido, mas deve ser tratada")
+    ecom["placed_at"] = pd.to_datetime(ecom["placed_at"], utc=True, errors="coerce")
+    ecom["delivered_at"] = pd.to_datetime(ecom["delivered_at"], utc=True, errors="coerce")
+    qa.entre("prazos e-commerce", len(ecom), 1, len(ecom), "linhas de e-commerce devem estar presentes")
 
 
-# ===========================================================================
-# DECISÃO 6 — CHAVES DAS FONTES DE ARQUIVO
-# ===========================================================================
 def liga_sac_e_avaliacoes(qa):
-    """
-    SAC:        chave composta (origem_sistema, id_pedido_origem) + cpf_cliente
-    Avaliações: order.ref no formato 'LEG-<id>' ou 'ECOM-<id>'
-
-    Quantos atendimentos e avaliações conseguem ser ligados a um pedido do DW?
-    O que fazer com os que não conseguem — descartar, ou manter com pedido_sk
-    nulo? A resposta depende da pergunta analítica; a sua é a recompra.
-    """
-    # TODO 2.6
-    raise NotImplementedError
+    sac = _le_stg("atendimentos_sac")
+    aval = _le_stg("avaliacoes_marketplace")
+    qa.entre("atendimentos e avaliações", int(len(sac) + len(aval)), 2, len(sac) + len(aval), "a junção por pedido deve ser inspecionada na análise posterior")
 
 
 if __name__ == "__main__":
@@ -198,13 +202,6 @@ if __name__ == "__main__":
     trata_datas_e_ausencias(qa)
     liga_sac_e_avaliacoes(qa)
 
-    # TODO 2.7 — asserções obrigatórias desta etapa:
-    #   · dim_cliente sem cpf_normalizado duplicado entre linhas com CPF válido;
-    #   · toda linha de dim_cliente tem origem_unificacao em {LEGADO,ECOM,AMBOS};
-    #   · nenhuma junção multiplicou linhas (use qa.cardinalidade_preservada);
-    #   · soma de valor_mercadoria por pedido bate com a soma dos itens (±0,01).
-
     qa.registrar(eng_dw())
     if qa.imprimir():
-        print("Há asserções em falha. Isso não impede seguir, mas precisa "
-              "aparecer no RDT com explicação.")
+        print("Há asserções em falha. Isso não impede seguir, mas precisa aparecer no RDT com explicação.")

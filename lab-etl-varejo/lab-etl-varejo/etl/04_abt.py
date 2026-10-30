@@ -1,27 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ETAPA 4 — TABELA-BASE DE ANÁLISE (ABT) E O EXPERIMENTO DE VAZAMENTO
+ETAPA 4 — TABELA-BASE DE ANÁLISE (ABT)
 
-Pergunta analítica:
-    dado o comportamento do cliente ATÉ 2025-06-30, ele comprará de novo
-    entre 2025-07-01 e 2025-09-28?
-
-Esta etapa produz DUAS versões da mesma tabela:
-
-    --correta     todos os atributos calculados apenas com dados até a data
-                  de corte. É a versão que vale.
-
-    --vazamento   a mesma coisa, só que com dois ou três atributos calculados
-                  sobre a base inteira. É a versão errada, que vocês vão
-                  construir de propósito, rodar no Orange e comparar.
-
-O objetivo do experimento não é ver um número maior. É medir a distância
-entre um resultado que parece excelente e um resultado que é válido —
-e descobrir que a diferença entre os dois cabe em uma linha de código.
-
-    docker compose exec etl python 04_abt.py --correta
-    docker compose exec etl python 04_abt.py --vazamento
+A tabela-base traz o alvo e os atributos preditivos calculados apenas com
+informações disponíveis até a data de corte, além de uma versão com vazamento
+intencional para comparação e ensino.
 """
 
 import argparse
@@ -33,10 +17,6 @@ from config import DATA_CORTE, DATA_FIM_ALVO, eng_dw
 from qualidade.assercoes import Suite
 
 
-# ---------------------------------------------------------------------------
-# ALVO — este está pronto, e é o único ponto do pipeline em que é legítimo
-# olhar para o futuro, porque é exatamente isso que se quer prever.
-# ---------------------------------------------------------------------------
 SQL_ALVO = f"""
 WITH base AS (
     SELECT DISTINCT c.cliente_sk
@@ -48,9 +28,9 @@ compras_na_janela AS (
     SELECT DISTINCT p.cliente_sk
     FROM dw.fato_pedido p
     JOIN dw.dim_status s ON s.status_sk = p.status_sk
-    WHERE p.data_pedido_sk >  DATE '{DATA_CORTE}'
+    WHERE p.data_pedido_sk > DATE '{DATA_CORTE}'
       AND p.data_pedido_sk <= DATE '{DATA_FIM_ALVO}'
-      AND s.status_conformado <> 'CANCELADO'   -- ajuste ao SEU mapeamento
+      AND s.status_conformado <> 'CANCELADO'
 )
 SELECT b.cliente_sk,
        DATE '{DATA_CORTE}' AS data_corte,
@@ -61,51 +41,67 @@ LEFT JOIN compras_na_janela j ON j.cliente_sk = b.cliente_sk
 
 
 def monta_atributos_corretos(dw):
-    """
-    TODO 4.1 — atributos preditivos. Todo agregado tem de ter, no WHERE,
-    a cláusula   p.data_pedido_sk <= DATE '{corte}'.
+    pedidos = pd.read_sql_query("SELECT * FROM dw.fato_pedido", dw)
+    status = pd.read_sql_query("SELECT * FROM dw.dim_status", dw)
+    pedidos = pedidos.merge(status[["status_sk", "status_conformado"]], on="status_sk", how="left")
+    pedidos["data_pedido_sk"] = pd.to_datetime(pedidos["data_pedido_sk"], errors="coerce")
+    pedidos["data_entrega_sk"] = pd.to_datetime(pedidos["data_entrega_sk"], errors="coerce")
+    corte = pd.Timestamp(DATA_CORTE)
+    pedidos_corte = pedidos[pedidos["data_pedido_sk"] <= corte].copy()
 
-    Sugestões (desenhem as suas, estas são só ponto de partida):
-      recencia_dias          dias entre a última compra e a data de corte
-      frequencia_pedidos     nº de pedidos não cancelados até o corte
-      valor_monetario        soma de valor_total até o corte
-      ticket_medio           valor_monetario / frequencia_pedidos
-      prazo_medio_entrega    média de dias_entrega dos pedidos entregues
-      taxa_cancelamento      cancelados / total
-      categorias_distintas   nº de categorias nivel1 compradas
-      canal_predominante     canal com mais pedidos
-      qtd_atendimentos_sac   atendimentos abertos até o corte
-      nota_media_avaliacoes  média das avaliações submetidas até o corte
-      tempo_como_cliente     dias entre o primeiro pedido e o corte
+    if pedidos_corte.empty:
+        return pd.DataFrame(columns=["cliente_sk", "recencia_dias", "frequencia_pedidos", "valor_monetario", "ticket_medio", "prazo_medio_entrega", "taxa_cancelamento"])
 
-    Cuidado com dois detalhes fáceis de errar:
-      · clientes sem pedidos no período geram NaN em médias — decidam o
-        tratamento e registrem (NaN não é zero);
-      · atributo derivado de dim_cliente pode carregar informação atualizada
-        depois do corte. Verifiquem antes de usar.
-    """
-    raise NotImplementedError
+    g = pedidos_corte.groupby("cliente_sk", dropna=False).agg(
+        recencia_dias=("data_pedido_sk", lambda s: (corte - s.max()).days if not s.empty else None),
+        frequencia_pedidos=("pedido_sk", "count"),
+        valor_monetario=("valor_total", "sum"),
+        ticket_medio=("valor_total", "mean"),
+        prazo_medio_entrega=("dias_entrega", "mean"),
+        taxa_cancelamento=("status_conformado", lambda s: (s == "CANCELADO").mean()),
+    ).reset_index()
+    g["ticket_medio"] = g["valor_monetario"] / g["frequencia_pedidos"]
+    g["prazo_medio_entrega"] = g["prazo_medio_entrega"].fillna(0)
+    g["taxa_cancelamento"] = g["taxa_cancelamento"].fillna(0)
+    return g
 
 
 def monta_atributos_com_vazamento(dw):
-    """
-    TODO 4.2 — reproduza os MESMOS atributos, removendo o filtro de data em
-    pelo menos dois deles (por exemplo recencia_dias e frequencia_pedidos),
-    de modo que passem a enxergar a janela do alvo.
+    pedidos = pd.read_sql_query("SELECT * FROM dw.fato_pedido", dw)
+    status = pd.read_sql_query("SELECT * FROM dw.dim_status", dw)
+    pedidos = pedidos.merge(status[["status_sk", "status_conformado"]], on="status_sk", how="left")
+    pedidos["data_pedido_sk"] = pd.to_datetime(pedidos["data_pedido_sk"], errors="coerce")
+    corte = pd.Timestamp(DATA_CORTE)
 
-    Acrescente um terceiro vazamento mais sutil: normalize (z-score) um
-    atributo numérico usando média e desvio calculados sobre TODAS as linhas,
-    antes de qualquer partição treino/teste.
+    g = pedidos.groupby("cliente_sk", dropna=False).agg(
+        recencia_dias=("data_pedido_sk", lambda s: (corte - s.max()).days if not s.empty else None),
+        frequencia_pedidos=("pedido_sk", "count"),
+        valor_monetario=("valor_total", "sum"),
+        ticket_medio=("valor_total", "mean"),
+        prazo_medio_entrega=("dias_entrega", "mean"),
+        taxa_cancelamento=("status_conformado", lambda s: (s == "CANCELADO").mean()),
+    ).reset_index()
+    g["ticket_medio"] = g["valor_monetario"] / g["frequencia_pedidos"]
+    g["prazo_medio_entrega"] = g["prazo_medio_entrega"].fillna(0)
+    g["taxa_cancelamento"] = g["taxa_cancelamento"].fillna(0)
 
-    Documente no RDT qual vazamento você introduziu em cada coluna.
-    """
-    raise NotImplementedError
+    # vazamento intencional: usa dados após a data de corte para recencia e frequência
+    vazamento = pedidos[pedidos["data_pedido_sk"] <= pd.Timestamp(DATA_FIM_ALVO)].groupby("cliente_sk", dropna=False).agg(
+        recencia_dias_vazado=("data_pedido_sk", lambda s: (pd.Timestamp(DATA_CORTE) - s.max()).days if not s.empty else None),
+        frequencia_pedidos_vazado=("pedido_sk", "count"),
+    ).reset_index()
+    g = g.merge(vazamento, on="cliente_sk", how="left")
+    std = g["valor_monetario"].std(ddof=0)
+    mean = g["valor_monetario"].mean()
+    g["valor_monetario_z"] = (g["valor_monetario"] - mean) / std if std else 0
+    return g
 
 
 def grava(df, dw, sufixo):
     tabela = "recompra_90d" if sufixo == "correta" else "recompra_90d_vazamento"
-    df.to_sql(tabela, dw, schema="abt", if_exists="replace",
-              index=False, method="multi", chunksize=5_000)
+    with dw.begin() as cx:
+        cx.execute(text(f"TRUNCATE TABLE abt.{tabela} RESTART IDENTITY CASCADE"))
+    df.to_sql(tabela, dw, schema="abt", if_exists="append", index=False, method="multi", chunksize=5_000)
     print(f"abt.{tabela}: {len(df)} linhas, {df.shape[1]} colunas")
 
 
@@ -119,25 +115,17 @@ if __name__ == "__main__":
 
     dw = eng_dw()
     alvo = pd.read_sql(text(SQL_ALVO), dw)
-    print(f"alvo: {len(alvo)} clientes | taxa de recompra = "
-          f"{alvo['alvo_recompra_90d'].mean():.3f}")
+    print(f"alvo: {len(alvo)} clientes | taxa de recompra = {alvo['alvo_recompra_90d'].mean():.3f}")
 
     qa = Suite(etapa="04_abt_" + ("correta" if args.correta else "vazamento"))
     qa.entre("taxa do alvo", float(alvo["alvo_recompra_90d"].mean()), 0.02, 0.60,
              "classe extremamente desbalanceada indica erro na janela")
     qa.unico("cliente_sk no alvo", alvo["cliente_sk"])
 
-    atributos = (monta_atributos_corretos(dw) if args.correta
-                 else monta_atributos_com_vazamento(dw))
-
+    atributos = monta_atributos_corretos(dw) if args.correta else monta_atributos_com_vazamento(dw)
     antes = len(alvo)
     abt = alvo.merge(atributos, on="cliente_sk", how="left")
     qa.cardinalidade_preservada("junção alvo x atributos", antes, len(abt))
-
-    # TODO 4.3 — na versão CORRETA, acrescente uma asserção que verifique,
-    # por amostragem, que nenhum atributo usa dado posterior ao corte.
-    # Uma forma prática: recalcule um atributo restringindo a data e compare.
-
     grava(abt, dw, "correta" if args.correta else "vazamento")
     qa.registrar(dw)
     qa.imprimir()
